@@ -6,12 +6,14 @@ const { Keypair } = require('./keypair')
 class Utxo {
   /** Initialize a new UTXO - unspent transaction output or input. Note, a full TX consists of 2/16 inputs and 2 outputs
    *
+   * @param {BigNumber | BigInt | number | string} token asset id
    * @param {BigNumber | BigInt | number | string} amount UTXO amount
    * @param {BigNumber | BigInt | number | string} blinding Blinding factor
    * @param {Keypair} keypair
    * @param {number|null} index UTXO index in the merkle tree
    */
-  constructor({ amount = 0, keypair = new Keypair(), blinding = randomBN(), index = null } = {}) {
+  constructor({ asset = 0, amount = 0, keypair = new Keypair(), blinding = randomBN(), index = null } = {}) {
+    this.asset = BigNumber.from(asset)
     this.amount = BigNumber.from(amount)
     this.blinding = BigNumber.from(blinding)
     this.keypair = keypair
@@ -25,7 +27,7 @@ class Utxo {
    */
   getCommitment() {
     if (!this._commitment) {
-      this._commitment = poseidonHash([this.amount, this.keypair.pubkey, this.blinding])
+      this._commitment = poseidonHash([this.amount, this.keypair.pubkey, this.blinding, this.asset])
     }
     return this._commitment
   }
@@ -58,7 +60,7 @@ class Utxo {
    * @returns {string} `0x`-prefixed hex string with data
    */
   encrypt() {
-    const bytes = Buffer.concat([toBuffer(this.amount, 31), toBuffer(this.blinding, 31)])
+    const bytes = Buffer.concat([toBuffer(this.amount, 31), toBuffer(this.blinding, 31), toBuffer(this.asset, 31)])
     return this.keypair.encrypt(bytes)
   }
 
@@ -75,6 +77,7 @@ class Utxo {
     return new Utxo({
       amount: BigNumber.from('0x' + buf.slice(0, 31).toString('hex')),
       blinding: BigNumber.from('0x' + buf.slice(31, 62).toString('hex')),
+      asset: BigNumber.from('0x' + buf.slice(62, 93).toString('hex')),
       keypair,
       index,
     })

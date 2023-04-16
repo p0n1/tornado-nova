@@ -29,15 +29,15 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
 
   IVerifier public immutable verifier2;
   IVerifier public immutable verifier16;
-  IERC6777 public immutable token;
   address public immutable omniBridge;
   address public immutable l1Unwrapper;
   address public immutable multisig;
 
-  uint256 public lastBalance;
   uint256 public __gap; // storage padding to prevent storage collision
   uint256 public maximumDepositAmount;
   mapping(bytes32 => bool) public nullifierHashes;
+
+  mapping(address => uint256) public lastBalanceOf;
 
   struct ExtData {
     address recipient;
@@ -56,6 +56,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     bytes32[] inputNullifiers;
     bytes32[2] outputCommitments;
     uint256 publicAmount;
+    uint256 publicAsset; // Only constrained when extAmount > 0.
     bytes32 extDataHash;
   }
 
@@ -79,7 +80,6 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     @param _verifier16 the address of SNARK verifier for 16 inputs
     @param _levels hight of the commitments merkle tree
     @param _hasher hasher address for the merkle tree
-    @param _token token address for the pool
     @param _omniBridge omniBridge address for specified token
     @param _l1Unwrapper address of the L1Helper
     @param _governance owner address
@@ -91,7 +91,6 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     IVerifier _verifier16,
     uint32 _levels,
     address _hasher,
-    IERC6777 _token,
     address _omniBridge,
     address _l1Unwrapper,
     address _governance,
@@ -103,7 +102,6 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
   {
     verifier2 = _verifier2;
     verifier16 = _verifier16;
-    token = _token;
     omniBridge = _omniBridge;
     l1Unwrapper = _l1Unwrapper;
     multisig = _multisig;
@@ -119,7 +117,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
   function transact(Proof memory _args, ExtData memory _extData) public {
     if (_extData.extAmount > 0) {
       // for deposits from L2
-      token.transferFrom(msg.sender, address(this), uint256(_extData.extAmount));
+      IERC6777(_args.publicAsset).transferFrom(msg.sender, address(this), uint256(_extData.extAmount));
       require(uint256(_extData.extAmount) <= maximumDepositAmount, "amount is larger than maximumDepositAmount");
     }
 
@@ -146,14 +144,13 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     bytes calldata _data
   ) external override {
     (Proof memory _args, ExtData memory _extData) = abi.decode(_data, (Proof, ExtData));
-    require(_token == token, "provided token is not supported");
     require(msg.sender == omniBridge, "only omni bridge");
     require(_amount >= uint256(_extData.extAmount), "amount from bridge is incorrect");
-    require(token.balanceOf(address(this)) >= uint256(_extData.extAmount) + lastBalance, "bridge did not send enough tokens");
+    require(_token.balanceOf(address(this)) >= uint256(_extData.extAmount) + lastBalanceOf[address(_token)], "bridge did not send enough tokens");
     require(uint256(_extData.extAmount) <= maximumDepositAmount, "amount is larger than maximumDepositAmount");
-    uint256 sentAmount = token.balanceOf(address(this)) - lastBalance;
+    uint256 sentAmount = _token.balanceOf(address(this)) - lastBalanceOf[address(_token)];
     try TornadoPool(address(this)).onTransact(_args, _extData) {} catch (bytes memory) {
-      token.transfer(multisig, sentAmount);
+      _token.transfer(multisig, sentAmount);
     }
   }
 
@@ -172,7 +169,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     uint256 _balance
   ) external onlyMultisig {
     require(_to != address(0), "TORN: can not send to zero address");
-    require(_token != token, "can not rescue pool asset");
+    // require(_token != token, "can not rescue pool asset"); TODO: add a token registry check to prevent rescuing tokens that are used in the pool
 
     if (_token == IERC6777(0)) {
       // for Ether
@@ -212,6 +209,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
           [
             uint256(_args.root),
             _args.publicAmount,
+            _args.publicAsset,
             uint256(_args.extDataHash),
             uint256(_args.inputNullifiers[0]),
             uint256(_args.inputNullifiers[1]),
@@ -226,6 +224,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
           [
             uint256(_args.root),
             _args.publicAmount,
+            _args.publicAsset,
             uint256(_args.extDataHash),
             uint256(_args.inputNullifiers[0]),
             uint256(_args.inputNullifiers[1]),
@@ -272,20 +271,23 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     if (_extData.extAmount < 0) {
       require(_extData.recipient != address(0), "Can't withdraw to zero address");
       if (_extData.isL1Withdrawal) {
-        token.transferAndCall(
+        IERC6777(_args.publicAsset).transferAndCall(
           omniBridge,
           uint256(-_extData.extAmount),
           abi.encodePacked(l1Unwrapper, abi.encode(_extData.recipient, _extData.l1Fee))
         );
       } else {
-        token.transfer(_extData.recipient, uint256(-_extData.extAmount));
+        IERC6777(_args.publicAsset).transfer(_extData.recipient, uint256(-_extData.extAmount));
       }
     }
     if (_extData.fee > 0) {
-      token.transfer(_extData.relayer, _extData.fee);
+      IERC6777(_args.publicAsset).transfer(_extData.relayer, _extData.fee);
     }
 
-    lastBalance = token.balanceOf(address(this));
+    if (_args.publicAsset !=  0) {
+      lastBalanceOf[address(_args.publicAsset)] = IERC6777(_args.publicAsset).balanceOf(address(this));
+    }
+    
     _insert(_args.outputCommitments[0], _args.outputCommitments[1]);
     emit NewCommitment(_args.outputCommitments[0], nextIndex - 2, _extData.encryptedOutput1);
     emit NewCommitment(_args.outputCommitments[1], nextIndex - 1, _extData.encryptedOutput2);
