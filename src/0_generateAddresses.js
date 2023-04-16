@@ -24,7 +24,6 @@ async function generate(config = defaultConfig) {
         config.verifier16,
         config.MERKLE_TREE_HEIGHT,
         config.hasher,
-        config.gcWeth,
         config.gcOmniBridge,
         config.l1Unwrapper,
         config.govAddress,

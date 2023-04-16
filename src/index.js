@@ -2,7 +2,7 @@
 const MerkleTree = require('fixed-merkle-tree')
 const { ethers } = require('hardhat')
 const { BigNumber } = ethers
-const { toFixedHex, poseidonHash2, getExtDataHash, FIELD_SIZE, shuffle } = require('./utils')
+const { toFixedHex, poseidonHash2, getExtDataHash, FIELD_SIZE, shuffle, debugLog } = require('./utils')
 const Utxo = require('./utxo')
 
 const { prove } = require('./prover')
@@ -17,6 +17,7 @@ async function buildMerkleTree({ tornadoPool }) {
 }
 
 async function getProof({
+  asset,
   inputs,
   outputs,
   tree,
@@ -27,6 +28,7 @@ async function getProof({
   isL1Withdrawal,
   l1Fee,
 }) {
+  debugLog("getProof> asset", asset)
   inputs = shuffle(inputs)
   outputs = shuffle(outputs)
 
@@ -58,13 +60,25 @@ async function getProof({
     l1Fee,
   }
 
+  // Check if extAmount is not zero. If so, set publicAsset to asset to enable onchain transfer and disable privacy for asset type.
+  let publicAsset = 0 // TODO: default to zero or magic number. zero is friendly for all old tests. magic number is more secure.
+  if (extAmount != 0) {
+    publicAsset = asset
+    console.log("getProof> extAmount is %s, expose publicAsset: %s", extAmount, publicAsset)
+  } else {
+    console.log("getProof> extAmount == 0, do not expose publicAsset")
+  }
+
   const extDataHash = getExtDataHash(extData)
   let input = {
     root: tree.root(),
     inputNullifier: inputs.map((x) => x.getNullifier()),
     outputCommitment: outputs.map((x) => x.getCommitment()),
     publicAmount: BigNumber.from(extAmount).sub(fee).add(FIELD_SIZE).mod(FIELD_SIZE).toString(),
+    publicAsset, // public input
     extDataHash,
+
+    asset: BigNumber.from(asset), // private input
 
     // data for 2 transaction inputs
     inAmount: inputs.map((x) => x.amount),
@@ -87,9 +101,12 @@ async function getProof({
     inputNullifiers: inputs.map((x) => toFixedHex(x.getNullifier())),
     outputCommitments: outputs.map((x) => toFixedHex(x.getCommitment())),
     publicAmount: toFixedHex(input.publicAmount),
+    publicAsset: toFixedHex(input.publicAsset),
     extDataHash: toFixedHex(extDataHash),
   }
-  // console.log('Solidity args', args)
+
+  debugLog('getProof> Solidity args', args)
+  debugLog('getProof> extData', extData)
 
   return {
     extData,
@@ -99,6 +116,7 @@ async function getProof({
 
 async function prepareTransaction({
   tornadoPool,
+  asset = 0,
   inputs = [],
   outputs = [],
   fee = 0,
@@ -107,14 +125,15 @@ async function prepareTransaction({
   isL1Withdrawal = false,
   l1Fee = 0,
 }) {
+  console.log("prepareTransaction> asset", asset)
   if (inputs.length > 16 || outputs.length > 2) {
     throw new Error('Incorrect inputs/outputs count')
   }
   while (inputs.length !== 2 && inputs.length < 16) {
-    inputs.push(new Utxo())
+    inputs.push(new Utxo({asset: asset}))
   }
   while (outputs.length < 2) {
-    outputs.push(new Utxo())
+    outputs.push(new Utxo({asset: asset}))
   }
 
   let extAmount = BigNumber.from(fee)
@@ -122,6 +141,7 @@ async function prepareTransaction({
     .sub(inputs.reduce((sum, x) => sum.add(x.amount), BigNumber.from(0)))
 
   const { args, extData } = await getProof({
+    asset,
     inputs,
     outputs,
     tree: await buildMerkleTree({ tornadoPool }),
