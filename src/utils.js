@@ -23,6 +23,13 @@ function debugLog(...args) {
 /** Generate random number of specified byte length */
 const randomBN = (nbytes = 31) => BigNumber.from(crypto.randomBytes(nbytes))
 
+  // address tokenOut;
+  // uint256 amountOutMin;
+  // address swapRecipient;
+  // address swapRouter;
+  // bytes swapData;
+  // bytes transactData;
+
 function getExtDataHash({
   recipient,
   extAmount,
@@ -32,12 +39,18 @@ function getExtDataHash({
   encryptedOutput2,
   isL1Withdrawal,
   l1Fee,
+  tokenOut,
+  amountOutMin,
+  swapRecipient,
+  swapRouter,
+  swapData,
+  transactData,
 }) {
   const abi = new ethers.utils.AbiCoder()
 
   const encodedData = abi.encode(
     [
-      'tuple(address recipient,int256 extAmount,address relayer,uint256 fee,bytes encryptedOutput1,bytes encryptedOutput2,bool isL1Withdrawal,uint256 l1Fee)',
+      'tuple(address recipient,int256 extAmount,address relayer,uint256 fee,bytes encryptedOutput1,bytes encryptedOutput2,bool isL1Withdrawal,uint256 l1Fee,address tokenOut,uint256 amountOutMin,address swapRecipient,address swapRouter,bytes swapData,bytes transactData)',
     ],
     [
       {
@@ -49,9 +62,16 @@ function getExtDataHash({
         encryptedOutput2: encryptedOutput2,
         isL1Withdrawal: isL1Withdrawal,
         l1Fee: l1Fee,
+        tokenOut: toFixedHex(tokenOut, 20),
+        amountOutMin: toFixedHex(amountOutMin),
+        swapRecipient: toFixedHex(swapRecipient, 20),
+        swapRouter: toFixedHex(swapRouter, 20),
+        swapData: swapData,
+        transactData: transactData,
       },
     ],
   )
+  debugLog("getExtDataHash> encodedData", encodedData)
   const hash = ethers.utils.keccak256(encodedData)
   return BigNumber.from(hash).mod(FIELD_SIZE)
 }

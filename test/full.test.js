@@ -5,12 +5,13 @@ const { expect } = require('chai')
 const { utils } = ethers
 
 const Utxo = require('../src/utxo')
-const { transaction, registerAndTransact, prepareTransaction, buildMerkleTree } = require('../src/index')
+const { transaction, swapTransaction, registerAndTransact, prepareTransaction, buildMerkleTree } = require('../src/index')
 const { toFixedHex, poseidonHash } = require('../src/utils')
 const { Keypair } = require('../src/keypair')
 const { encodeDataForBridge } = require('./utils')
 const config = require('../config')
 const { generate } = require('../src/0_generateAddresses')
+const { debugLog } = require('../src/utils')
 
 const MERKLE_TREE_HEIGHT = 5
 const l1ChainId = 1
@@ -41,6 +42,8 @@ describe('TornadoPool', function () {
     const amb = await deploy('MockAMB', gov.address, l1ChainId)
     const omniBridge = await deploy('MockOmniBridge', amb.address)
 
+    const swapExecutor = await deploy('SwapExecutor')
+
     // deploy L1Unwrapper with CREATE2
     const singletonFactory = await ethers.getContractAt('SingletonFactory', config.singletonFactory)
 
@@ -48,6 +51,7 @@ describe('TornadoPool', function () {
     customConfig.omniBridge = omniBridge.address
     customConfig.weth = l1Token.address
     customConfig.multisig = multisig.address
+    customConfig.swapExecutor = swapExecutor.address
     const contracts = await generate(customConfig)
     await singletonFactory.deploy(contracts.unwrapperContract.bytecode, config.salt)
     const l1Unwrapper = await ethers.getContractAt('L1Unwrapper', contracts.unwrapperContract.address)
@@ -64,6 +68,7 @@ describe('TornadoPool', function () {
       gov.address,
       l1ChainId,
       multisig.address,
+      swapExecutor.address,
     )
 
     const { data } = await tornadoPoolImpl.populateTransaction.initialize(MAXIMUM_DEPOSIT_AMOUNT)
@@ -80,7 +85,7 @@ describe('TornadoPool', function () {
 
     await token.approve(tornadoPool.address, utils.parseEther('10000'))
 
-    return { tornadoPool, token, proxy, omniBridge, amb, gov, multisig, l1Unwrapper, sender, l1Token }
+    return { tornadoPool, token, proxy, omniBridge, amb, gov, multisig, l1Unwrapper, sender, l1Token, swapExecutor }
   }
 
   describe('Upgradeability tests', () => {
@@ -224,6 +229,161 @@ describe('TornadoPool', function () {
 
     const bobBalance = await token.balanceOf(bobEthAddress)
     expect(bobBalance).to.be.equal(bobWithdrawAmount)
+  })
+
+  it('should deposit, transact, withdraw (swap)', async function () {
+    const { tornadoPool, token, swapExecutor } = await loadFixture(fixture)
+
+    const token1 = await deploy('PermittableToken', 'Random Token 1', 'RT1', 18, l1ChainId)
+    console.log('token1', token1.address)
+
+    // Alice deposits into tornado pool
+    const aliceDepositAmount = utils.parseEther('0.1')
+    const aliceDepositUtxo = new Utxo({ asset: token.address, amount: aliceDepositAmount })
+    await transaction({ tornadoPool, asset: token.address, outputs: [aliceDepositUtxo] })
+
+    // Bob gives Alice address to send some eth inside the shielded pool
+    const bobKeypair = new Keypair() // contains private and public keys
+    const bobAddress = bobKeypair.address() // contains only public key
+
+    // Alice sends some funds to Bob
+    const bobSendAmount = utils.parseEther('0.06')
+    const bobSendUtxo = new Utxo({ asset: token.address, amount: bobSendAmount, keypair: Keypair.fromString(bobAddress) })
+    const aliceChangeUtxo = new Utxo({
+      asset: token.address,
+      amount: aliceDepositAmount.sub(bobSendAmount),
+      keypair: aliceDepositUtxo.keypair,
+    })
+    await transaction({ tornadoPool, asset: token.address, inputs: [aliceDepositUtxo], outputs: [bobSendUtxo, aliceChangeUtxo] })
+
+    // Bob parses chain to detect incoming funds
+    const filter = tornadoPool.filters.NewCommitment()
+    const fromBlock = await ethers.provider.getBlock()
+    const events = await tornadoPool.queryFilter(filter, fromBlock.number)
+    let bobReceiveUtxo
+    try {
+      bobReceiveUtxo = Utxo.decrypt(bobKeypair, events[0].args.encryptedOutput, events[0].args.index)
+    } catch (e) {
+      // we try to decrypt another output here because it shuffles outputs before sending to blockchain
+      bobReceiveUtxo = Utxo.decrypt(bobKeypair, events[1].args.encryptedOutput, events[1].args.index)
+    }
+    expect(bobReceiveUtxo.amount).to.be.equal(bobSendAmount)
+
+    // Bob withdraws a part of his funds from the shielded pool
+    const bobWithdrawAmount = utils.parseEther('0.05')
+    const bobEthAddress = '0xDeaD00000000000000000000000000000000BEEf'
+    const bobChangeUtxo = new Utxo({ asset: token.address, amount: bobSendAmount.sub(bobWithdrawAmount), keypair: bobKeypair })
+
+    // do not want to deploy a DEX for test here, so mint token directly to swapExecutor 
+    const token1TargetAmount = utils.parseEther('123')
+    await token1.mint(swapExecutor.address, token1TargetAmount)
+
+    await swapTransaction({
+      tornadoPool,
+      asset: token.address,
+      inputs: [bobReceiveUtxo],
+      outputs: [bobChangeUtxo],
+      recipient: swapExecutor.address,
+      tokenOut: token1.address,
+      amountOutMin: token1TargetAmount,
+      swapRecipient: bobEthAddress,
+      // swapRouter simplify the swap test
+      // swapData
+      // transactData
+    })
+
+    const bobBalance = await token1.balanceOf(bobEthAddress)
+    expect(bobBalance).to.be.equal(token1TargetAmount) // swap worked
+  })
+
+  it('should deposit, transact, withdraw (swap), and deposit (re-shield)', async function () {
+    debugLog(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+    const { tornadoPool, token, swapExecutor } = await loadFixture(fixture)
+
+    const token1 = await deploy('PermittableToken', 'Random Token 1', 'RT1', 18, l1ChainId)
+    console.log('token1', token1.address)
+
+    // Alice deposits into tornado pool
+    const aliceDepositAmount = utils.parseEther('0.1')
+    const aliceDepositUtxo = new Utxo({ asset: token.address, amount: aliceDepositAmount })
+    await transaction({ tornadoPool, asset: token.address, outputs: [aliceDepositUtxo] })
+
+    // Bob gives Alice address to send some eth inside the shielded pool
+    const bobKeypair = new Keypair() // contains private and public keys
+    const bobAddress = bobKeypair.address() // contains only public key
+
+    // Alice sends some funds to Bob
+    const bobSendAmount = utils.parseEther('0.06')
+    const bobSendUtxo = new Utxo({ asset: token.address, amount: bobSendAmount, keypair: Keypair.fromString(bobAddress) })
+    const aliceChangeUtxo = new Utxo({
+      asset: token.address,
+      amount: aliceDepositAmount.sub(bobSendAmount),
+      keypair: aliceDepositUtxo.keypair,
+    })
+    await transaction({ tornadoPool, asset: token.address, inputs: [aliceDepositUtxo], outputs: [bobSendUtxo, aliceChangeUtxo] })
+
+    // Bob parses chain to detect incoming funds
+    const filter = tornadoPool.filters.NewCommitment()
+    const fromBlock = await ethers.provider.getBlock()
+    const events = await tornadoPool.queryFilter(filter, fromBlock.number)
+    let bobReceiveUtxo
+    try {
+      bobReceiveUtxo = Utxo.decrypt(bobKeypair, events[0].args.encryptedOutput, events[0].args.index)
+    } catch (e) {
+      // we try to decrypt another output here because it shuffles outputs before sending to blockchain
+      bobReceiveUtxo = Utxo.decrypt(bobKeypair, events[1].args.encryptedOutput, events[1].args.index)
+    }
+    expect(bobReceiveUtxo.amount).to.be.equal(bobSendAmount)
+
+    // Bob withdraws a part of his funds from the shielded pool
+    const bobWithdrawAmount = utils.parseEther('0.05')
+    const bobEthAddress = '0xDeaD00000000000000000000000000000000BEEf'
+    const bobChangeUtxo = new Utxo({ asset: token.address, amount: bobSendAmount.sub(bobWithdrawAmount), keypair: bobKeypair })
+
+    // do not want to deploy a DEX for test here, so mint token directly to swapExecutor 
+    const token1TargetAmount = utils.parseEther('0.123')
+    await token1.mint(swapExecutor.address, token1TargetAmount)
+
+    // test re-shield
+    // deposit token1 into tornado pool
+    const token1DepositUtxo = new Utxo({ asset: token1.address, amount: token1TargetAmount, keypair: aliceDepositUtxo.keypair }) // send back to alice for fun
+    const { args, extData } = await prepareTransaction({
+      tornadoPool,
+      asset: token1.address,
+      outputs: [token1DepositUtxo],
+    })
+
+    const transactData = encodeDataForBridge({ // not for bridge, just borrow the function
+      proof: args,
+      extData,
+    })
+
+    await swapTransaction({
+      tornadoPool,
+      asset: token.address,
+      inputs: [bobReceiveUtxo],
+      outputs: [bobChangeUtxo],
+      recipient: swapExecutor.address,
+      tokenOut: token1.address,
+      amountOutMin: token1TargetAmount,
+      swapRecipient: 0, // 0 means will re-shield into the pool
+      // swapRouter simplify the swap test
+      // swapData
+      transactData
+    })
+
+    const fromBlock2 = await ethers.provider.getBlock()
+    const events2 = await tornadoPool.queryFilter(filter, fromBlock2.number)
+    // console.log("events2:", events2)
+    let aliceReceiveUtxo
+    try {
+      aliceReceiveUtxo = Utxo.decrypt(aliceDepositUtxo.keypair, events2[2].args.encryptedOutput, events2[2].args.index)
+    } catch (e) {
+      // we try to decrypt another output here because it shuffles outputs before sending to blockchain
+      aliceReceiveUtxo = Utxo.decrypt(aliceDepositUtxo.keypair, events2[3].args.encryptedOutput, events2[3].args.index)
+    }
+    expect(aliceReceiveUtxo.amount).to.be.equal(token1TargetAmount)
+    debugLog("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<")
   })
 
   it('should deposit, transact and withdraw (multi assets)', async function () {
