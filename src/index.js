@@ -27,7 +27,14 @@ async function getProof({
   relayer,
   isL1Withdrawal,
   l1Fee,
+  tokenOut,
+  amountOutMin,
+  swapRecipient,
+  swapRouter,
+  swapData,
+  transactData,
 }) {
+  debugLog("----------getProof start----------")
   debugLog("getProof> asset", asset)
   inputs = shuffle(inputs)
   outputs = shuffle(outputs)
@@ -49,6 +56,13 @@ async function getProof({
     }
   }
 
+  // address tokenOut;
+  // uint256 amountOutMin;
+  // address swapRecipient;
+  // address swapRouter;
+  // bytes swapData;
+  // bytes transactData;
+
   const extData = {
     recipient: toFixedHex(recipient, 20),
     extAmount: toFixedHex(extAmount),
@@ -58,6 +72,12 @@ async function getProof({
     encryptedOutput2: outputs[1].encrypt(),
     isL1Withdrawal,
     l1Fee,
+    tokenOut: toFixedHex(tokenOut, 20),
+    amountOutMin: toFixedHex(amountOutMin),
+    swapRecipient: toFixedHex(swapRecipient, 20),
+    swapRouter: toFixedHex(swapRouter, 20),
+    swapData: swapData,
+    transactData: transactData,
   }
 
   // Check if extAmount is not zero. If so, set publicAsset to asset to enable onchain transfer and disable privacy for asset type.
@@ -101,13 +121,14 @@ async function getProof({
     inputNullifiers: inputs.map((x) => toFixedHex(x.getNullifier())),
     outputCommitments: outputs.map((x) => toFixedHex(x.getCommitment())),
     publicAmount: toFixedHex(input.publicAmount),
-    publicAsset: toFixedHex(input.publicAsset),
+    publicAsset: toFixedHex(input.publicAsset, 20),
     extDataHash: toFixedHex(extDataHash),
   }
 
+  debugLog('getProof> input', input)
   debugLog('getProof> Solidity args', args)
   debugLog('getProof> extData', extData)
-
+  debugLog("----------getProof end----------")
   return {
     extData,
     args,
@@ -124,7 +145,14 @@ async function prepareTransaction({
   relayer = 0,
   isL1Withdrawal = false,
   l1Fee = 0,
+  tokenOut = 0,
+  amountOutMin = 0,
+  swapRecipient = 0,
+  swapRouter = 0,
+  swapData = 0,
+  transactData = 0,
 }) {
+  debugLog("----------prepareTransaction start----------")
   console.log("prepareTransaction> asset", asset)
   if (inputs.length > 16 || outputs.length > 2) {
     throw new Error('Incorrect inputs/outputs count')
@@ -151,8 +179,14 @@ async function prepareTransaction({
     relayer,
     isL1Withdrawal,
     l1Fee,
+    tokenOut,
+    amountOutMin,
+    swapRecipient,
+    swapRouter,
+    swapData,
+    transactData,
   })
-
+  debugLog("----------prepareTransaction end----------")
   return {
     args,
     extData,
@@ -171,6 +205,18 @@ async function transaction({ tornadoPool, ...rest }) {
   return await receipt.wait()
 }
 
+async function swapTransaction({ tornadoPool, ...rest }) {
+  const { args, extData } = await prepareTransaction({
+    tornadoPool,
+    ...rest,
+  })
+
+  const receipt = await tornadoPool.transactAndSwap(args, extData, {
+    gasLimit: 4e6,
+  })
+  return await receipt.wait()
+}
+
 async function registerAndTransact({ tornadoPool, account, ...rest }) {
   const { args, extData } = await prepareTransaction({
     tornadoPool,
@@ -183,4 +229,4 @@ async function registerAndTransact({ tornadoPool, account, ...rest }) {
   await receipt.wait()
 }
 
-module.exports = { transaction, registerAndTransact, prepareTransaction, buildMerkleTree }
+module.exports = { transaction, swapTransaction, registerAndTransact, prepareTransaction, buildMerkleTree }

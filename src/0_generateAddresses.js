@@ -29,6 +29,7 @@ async function generate(config = defaultConfig) {
         config.govAddress,
         config.l1ChainId,
         config.gcMultisig,
+        config.swapExecutor,
       ])
       .slice(2)
 
