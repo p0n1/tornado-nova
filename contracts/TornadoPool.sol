@@ -17,6 +17,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { IERC20Receiver, IERC6777, IOmniBridge } from "./interfaces/IBridge.sol";
 import { CrossChainGuard } from "./bridge/CrossChainGuard.sol";
 import { IVerifier } from "./interfaces/IVerifier.sol";
+import { ISwapExecutor } from "./interfaces/ISwapExecutor.sol";
 import "./MerkleTreeWithHistory.sol";
 
 /** @dev This contract(pool) allows deposit of an arbitrary amount to it, shielded transfer to another registered user inside the pool
@@ -32,6 +33,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
   address public immutable omniBridge;
   address public immutable l1Unwrapper;
   address public immutable multisig;
+  ISwapExecutor public immutable swapExecutor;
 
   uint256 public __gap; // storage padding to prevent storage collision
   uint256 public maximumDepositAmount;
@@ -48,6 +50,12 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     bytes encryptedOutput2;
     bool isL1Withdrawal;
     uint256 l1Fee;
+    address tokenOut; // unshield -> swap via uni or 0x -> re-shield to this token
+    uint256 amountOutMin;
+    address swapRecipient;
+    address swapRouter;
+    bytes swapData; // maybe we can move swapRouter and swapData outside extdata hash calculation, and let relayer fill them to enhance privacy
+    bytes transactData; // used for re-shield
   }
 
   struct Proof {
@@ -56,7 +64,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     bytes32[] inputNullifiers;
     bytes32[2] outputCommitments;
     uint256 publicAmount;
-    uint256 publicAsset; // Only constrained when extAmount > 0.
+    address publicAsset; // Only constrained when extAmount != 0. We verify in contract that publicAsset is not zero address when extAmount != 0
     bytes32 extDataHash;
   }
 
@@ -95,7 +103,8 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     address _l1Unwrapper,
     address _governance,
     uint256 _l1ChainId,
-    address _multisig
+    address _multisig,
+    address _swapExecutor
   )
     MerkleTreeWithHistory(_levels, _hasher)
     CrossChainGuard(address(IOmniBridge(_omniBridge).bridgeContract()), _l1ChainId, _governance)
@@ -105,6 +114,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     omniBridge = _omniBridge;
     l1Unwrapper = _l1Unwrapper;
     multisig = _multisig;
+    swapExecutor = ISwapExecutor(_swapExecutor);
   }
 
   function initialize(uint256 _maximumDepositAmount) external initializer {
@@ -117,11 +127,42 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
   function transact(Proof memory _args, ExtData memory _extData) public {
     if (_extData.extAmount > 0) {
       // for deposits from L2
+      // The publicAsset must not be zero because the circuit assumes contract do the check. or attackers can use zero address to bypass utxo constraints in circuit to mint arbitrary tokens.
+      require(_args.publicAsset != address(0), "publicAsset should not be 0x0");
+      // WARN: The compiler actually generates a isContract check for us here which prevents publicAsset as zero address. A non-contract address could bypass this function if we use low-level call here. Maybe we can add a balance check here but we still cannot prevent malicious tokens.
       IERC6777(_args.publicAsset).transferFrom(msg.sender, address(this), uint256(_extData.extAmount));
       require(uint256(_extData.extAmount) <= maximumDepositAmount, "amount is larger than maximumDepositAmount");
     }
-
+    require(_extData.recipient != address(swapExecutor), "recipient should not be swapExecutor"); // relayer must use transactAndSwap instead
     _transact(_args, _extData);
+  }
+
+  function transactAndSwap(Proof memory _args, ExtData memory _extData) public {
+    require(_extData.extAmount < 0, "extAmount should be negative");
+    require(_args.publicAsset != address(0), "publicAsset should not be 0x0"); // have to withdraw something
+
+    // actually withdraw
+    _transact(_args, _extData);
+
+    // swap and transfer or re-shield
+    require(_extData.recipient == address(swapExecutor), "only swapExecutor can be recipient");
+    require(_extData.tokenOut != address(0), "tokenOut should not be 0x0");
+    require(_extData.amountOutMin > 0, "amountOutMin should be greater than 0");
+    // function executeSwap(
+    //     address _tokenIn,
+    //     address _tokenOut,
+    //     uint256 _amountIn,
+    //     uint256 _amountOutMin,
+    //     address _swapRouter,
+    //     address _swapRecipient,
+    //     bytes calldata _swapData,
+    //     bytes calldata _transactData
+    // ) 
+    swapExecutor.executeSwap(
+      address(_args.publicAsset), _extData.tokenOut,
+      uint256(-_extData.extAmount), _extData.amountOutMin,
+      _extData.swapRouter, _extData.swapRecipient,
+      _extData.swapData, _extData.transactData);
   }
 
   function register(Account memory _account) public {
@@ -159,6 +200,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
    */
   function onTransact(Proof memory _args, ExtData memory _extData) external {
     require(msg.sender == address(this), "can be called only from onTokenBridged");
+    require(_extData.recipient != address(swapExecutor), "recipient should not be swapExecutor"); // relayer must use transactAndSwap instead
     _transact(_args, _extData);
   }
 
@@ -209,7 +251,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
           [
             uint256(_args.root),
             _args.publicAmount,
-            _args.publicAsset,
+            uint256(_args.publicAsset),
             uint256(_args.extDataHash),
             uint256(_args.inputNullifiers[0]),
             uint256(_args.inputNullifiers[1]),
@@ -224,7 +266,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
           [
             uint256(_args.root),
             _args.publicAmount,
-            _args.publicAsset,
+            uint256(_args.publicAsset),
             uint256(_args.extDataHash),
             uint256(_args.inputNullifiers[0]),
             uint256(_args.inputNullifiers[1]),
@@ -269,6 +311,7 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
     }
 
     if (_extData.extAmount < 0) {
+      require(_args.publicAsset != address(0), "publicAsset should not be 0x0");
       require(_extData.recipient != address(0), "Can't withdraw to zero address");
       if (_extData.isL1Withdrawal) {
         IERC6777(_args.publicAsset).transferAndCall(
@@ -281,10 +324,11 @@ contract TornadoPool is MerkleTreeWithHistory, IERC20Receiver, ReentrancyGuard, 
       }
     }
     if (_extData.fee > 0) {
+      require(_args.publicAsset != address(0), "publicAsset should not be 0x0");
       IERC6777(_args.publicAsset).transfer(_extData.relayer, _extData.fee);
     }
 
-    if (_args.publicAsset !=  0) {
+    if (_args.publicAsset !=  address(0x0)) {
       lastBalanceOf[address(_args.publicAsset)] = IERC6777(_args.publicAsset).balanceOf(address(this));
     }
     
