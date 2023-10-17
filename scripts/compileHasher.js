@@ -17,6 +17,7 @@ const contract = {
   contractName: 'Hasher',
   abi: genContract.generateABI(2),
   bytecode: genContract.createCode(2),
+  deployedBytecode: genContract.createCode(2),
 }
 
 fs.writeFileSync(outputFile, JSON.stringify(contract, null, 2))

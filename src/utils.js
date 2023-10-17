@@ -11,6 +11,15 @@ const FIELD_SIZE = BigNumber.from(
   '21888242871839275222246405745257275088548364400416034343698204186575808495617',
 )
 
+require('dotenv').config();
+const DEBUG = process.env.DEBUG === 'true';
+
+function debugLog(...args) {
+  if (DEBUG) {
+    console.log(...args);
+  }
+}
+
 /** Generate random number of specified byte length */
 const randomBN = (nbytes = 31) => BigNumber.from(crypto.randomBytes(nbytes))
 
@@ -107,4 +116,5 @@ module.exports = {
   getExtDataHash,
   shuffle,
   getSignerFromAddress,
+  debugLog,
 }
